@@ -3,8 +3,9 @@ mod engine;
 mod error;
 mod middleware;
 mod router;
+mod worker_pool;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
     extract::{Host, Query, State},
@@ -18,13 +19,21 @@ use indexmap::IndexMap;
 use matchit::Match;
 use middleware::ServerTimeLayer;
 use std::collections::HashMap;
-use tokio::net::TcpListener;
+use tokio::{
+    net::TcpListener,
+    sync::{
+        mpsc::{self, Sender},
+        oneshot,
+    },
+    task,
+};
 use tracing::info;
 
 pub use config::*;
 pub use engine::*;
 pub use error::AppError;
 pub use router::*;
+pub use worker_pool::*;
 
 type ProjectRoutes = IndexMap<String, Vec<ProjectRoute>>;
 
@@ -32,6 +41,7 @@ type ProjectRoutes = IndexMap<String, Vec<ProjectRoute>>;
 pub struct AppState {
     // key is hostname
     routers: DashMap<String, SwappableAppRouter>,
+    tx: Sender<Command>,
 }
 
 #[derive(Clone)]
@@ -46,11 +56,17 @@ pub async fn start_server(port: u16, routers: Vec<TenentRouter>) -> Result<()> {
 
     info!("listening on {}", listener.local_addr()?);
 
+    let (tx, rx) = mpsc::channel::<Command>(32);
+    let worker_pool = WorkerPool::new(rx);
+
+    //todo:
+    task::spawn(async move { worker_pool.start().await.unwrap() });
+
     let map = DashMap::new();
     for TenentRouter { host, router } in routers {
         map.insert(host, router);
     }
-    let state = AppState::new(map);
+    let state = AppState::new(map, tx);
     let app = Router::new()
         .route("/*path", any(handler))
         .layer(ServerTimeLayer)
@@ -69,20 +85,30 @@ async fn handler(
     Query(query): Query<HashMap<String, String>>,
     body: Option<Bytes>,
 ) -> Result<impl IntoResponse, AppError> {
-    let router = get_router_by_host(host, state)?;
+    let router = get_router_by_host(host, state.clone())?;
     let matched = router.match_it(parts.method.clone(), parts.uri.path())?;
     let req = assemble_req(&matched, &parts, query, body)?;
     let handler = matched.value;
-    // TODO: build a worker pool, and send req via mpsc channel and get res from oneshot channel
-    // but if code changed we need to recreate the worker pool
-    let worker = JsWorker::try_new(&router.code)?;
-    let res = worker.run(handler, req)?;
+    //// TODO: build a worker pool, and send req via mpsc channel and get res from oneshot channel
+    //// but if code changed we need to recreate the worker pool
+    let (tx, mut rx) = oneshot::channel::<Res>();
+    let cmd = Command::new(String::from(&router.code), String::from(handler), req, tx);
+    state
+        .tx
+        .send(cmd)
+        .await
+        .map_err(|_| AppError::Anyhow(anyhow!("Send request failed.")))?;
+    // let worker = JsWorker::try_new(&router.code)?;
+    // let res = worker.run(handler, req)?;
+    let res = rx
+        .await
+        .map_err(|_| AppError::Anyhow(anyhow!("Receive response failed.")))?;
     Ok(Response::from(res))
 }
 
 impl AppState {
-    pub fn new(routers: DashMap<String, SwappableAppRouter>) -> Self {
-        Self { routers }
+    pub fn new(routers: DashMap<String, SwappableAppRouter>, tx: Sender<Command>) -> Self {
+        Self { routers, tx }
     }
 }
 
